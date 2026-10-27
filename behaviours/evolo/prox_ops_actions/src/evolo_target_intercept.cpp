@@ -41,7 +41,7 @@ class EvoloTargetIntercept {
     node_->declare_parameter("geofence_check_enabled", false);
     node_->declare_parameter("geofence_status_max_age_s", 2.0);
     node_->declare_parameter("geofence_polygons_max_age_s", 10.0);
-    node_->declare_parameter("odom_max_age_s", 1.0);
+    node_->declare_parameter("odom_max_age_s", 2.0);
 
     backend_status_max_age_s_ =
         node_->get_parameter("backend_status_max_age_s").as_double();

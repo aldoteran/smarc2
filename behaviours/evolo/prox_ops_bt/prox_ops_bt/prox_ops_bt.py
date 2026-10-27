@@ -27,7 +27,10 @@ class ProxOpsBT:
     REQUIRED_GOAL_SECTIONS = {
         "inspect",
         "intercept",
+    }
+    AWAIT_CONVERGENCE_GOAL_SECTIONS = {
         "loiter_patrol",
+        "wait_for_convergence",
     }
 
     def __init__(self, node: Node):
@@ -39,16 +42,26 @@ class ProxOpsBT:
                                                    "target_intercept")
         self.act_loiter_patrol = A_ActionClient(node, "evolo_loiter_patrol",
                                                 "loiter_patrol")
+        self.act_wait_for_convergence = A_ActionClient(
+            node, "smarc_wait", "wait_for_convergence")
         
-        # This will mean that all action clients must be available from
-        # startup since the BT will check whether they're alive or not.
+        # Only the actions that every prox-ops goal needs must be available at
+        # startup. The selected await-convergence action is checked when used.
+        self._required_startup_action_clients = [
+            self.act_target_inspect,
+            self.act_target_intercept,
+        ]
+
         self._action_clients = [
             self.act_target_inspect,
             self.act_target_intercept,
             self.act_loiter_patrol,
+            self.act_wait_for_convergence,
         ]
 
         self._goal: dict = self._empty_goal()
+        self._await_convergence_mode = "loiter_patrol"
+        self._setup_action_clients = set()
 
         self._bt: BehaviourTree | None = None
         self._prev_tree_str = ""
@@ -182,14 +195,27 @@ class ProxOpsBT:
                 f"prox-ops goal missing required sections: {sorted(missing_sections)}"
             )
 
-        unknown_sections = provided_sections - self.REQUIRED_GOAL_SECTIONS
+        await_sections = provided_sections & self.AWAIT_CONVERGENCE_GOAL_SECTIONS
+        if len(await_sections) != 1:
+            raise ValueError(
+                "prox-ops goal must contain exactly one of "
+                f"{sorted(self.AWAIT_CONVERGENCE_GOAL_SECTIONS)}"
+            )
+
+        unknown_sections = (
+            provided_sections
+            - self.REQUIRED_GOAL_SECTIONS
+            - self.AWAIT_CONVERGENCE_GOAL_SECTIONS
+        )
         if unknown_sections:
             raise ValueError(
                 f"prox-ops goal has unknown sections: {sorted(unknown_sections)}"
             )
 
+        await_section = next(iter(await_sections))
+
         goal = self._empty_goal()
-        for section in self.REQUIRED_GOAL_SECTIONS:
+        for section in self.REQUIRED_GOAL_SECTIONS | await_sections:
             section_goal = goal_request[section]
             if not isinstance(section_goal, dict):
                 raise ValueError(
@@ -197,9 +223,31 @@ class ProxOpsBT:
                 )
             goal[section] = section_goal
 
+        self._require_positive_float(goal[await_section], await_section,
+                                     "timeout_s")
+        self._await_convergence_mode = await_section
+
         # TODO: Decide whether the intercept section should have an explicit
         # mode field once evolo_target_intercept needs one.
         return goal
+
+    def _require_positive_float(self, section_goal: dict, section: str,
+                                field: str) -> None:
+        if field not in section_goal:
+            raise ValueError(
+                f"prox-ops goal section '{section}' missing required field '{field}'"
+            )
+
+        try:
+            value = float(section_goal[field])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"prox-ops goal field '{section}.{field}' must be numeric"
+            ) from exc
+
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"prox-ops goal field '{section}.{field}' must be > 0.0")
 
     def _on_goal_received(self, goal_request: dict) -> bool:
         self.log(f"Received new prox-ops goal request: {goal_request}")
@@ -207,6 +255,7 @@ class ProxOpsBT:
 
         try:
             self._goal = self._parse_goal_request(goal_request)
+            self._build_tree()
         except Exception as exc:
             self.log(f"Rejecting prox-ops goal: {exc}")
             return False
@@ -226,7 +275,7 @@ class ProxOpsBT:
         self._publish_backend_command("RESET", "prox_ops_bt started")
         self._publish_backend_command("START", "prox_ops_bt started")
         
-        # Start patrol timer/counter.
+        # Start await-convergence timer/counter.
         self._patrol_started_time_s = self._now_s
 
     @property
@@ -257,7 +306,7 @@ class ProxOpsBT:
         root_status = self._bt.root.status
         # FIXME: Will this fail prematurely? Should it only be a failure
         # if the patrol timeout is reached?
-        if root_status == Status.FAILURE or not self._patrol_timeout_not_exceeded():
+        if root_status == Status.FAILURE or not self._await_convergence_timeout_not_exceeded():
             self.log("We have failed to prox-ops.")
             self._reset_states()
             return False
@@ -271,11 +320,17 @@ class ProxOpsBT:
             ActionClientState.RUNNING,
             ActionClientState.CANCELLING,
         }
-        if action_client.state in running_states | {ActionClientState.READY}:
+        if (action_client in self._setup_action_clients
+                and action_client.state
+                in running_states | {ActionClientState.READY}):
             return True
 
         action_client.setup()
-        return action_client.state == ActionClientState.READY
+        if action_client.state == ActionClientState.READY:
+            self._setup_action_clients.add(action_client)
+            return True
+
+        return False
 
     def _set_goal(self, action_client: A_ActionClient, goal: dict,
                   name: str) -> bool:
@@ -312,6 +367,18 @@ class ProxOpsBT:
             self.act_loiter_patrol,
             self._goal.get("loiter_patrol", {}),
             "loiter patrol",
+        )
+
+    def _set_goal_wait_for_convergence(self) -> bool:
+        wait_goal = {
+            "timeout": float(
+                self._goal.get("wait_for_convergence", {}).get(
+                    "timeout_s", 0.0))
+        }
+        return self._set_goal(
+            self.act_wait_for_convergence,
+            wait_goal,
+            "wait for convergence",
         )
 
     def _target_intercepted(self) -> bool:
@@ -373,7 +440,7 @@ class ProxOpsBT:
         ))
         
         if health_ok and converged and status.plan_available and not status.target_lost:
-            # We're in intercept mode now. Reset both inspection and patrol
+            # We're in intercept mode now. Reset both inspection and await
             # timeouts.
             self._inspection_started_time_s = None
             self._patrol_started_time_s = None
@@ -393,9 +460,10 @@ class ProxOpsBT:
         ))
         return converged and status.plan_available and not status.target_lost
 
-    def _patrol_timeout_not_exceeded(self) -> bool:
+    def _await_convergence_timeout_not_exceeded(self) -> bool:
         timeout_s = float(
-            self._goal.get("loiter_patrol", {}).get("timeout_s", 0.0))
+            self._goal.get(self._await_convergence_mode,
+                           {}).get("timeout_s", 0.0))
         if timeout_s <= 0.0:
             return True
 
@@ -407,7 +475,7 @@ class ProxOpsBT:
 
         # If we got here it means that we've failed the prox-ops.
         self._publish_backend_stop_reset_once(
-            "patrol_timeout_exceeded",
+            f"{self._await_convergence_mode}_timeout_exceeded",
             "_patrol_timeout_stop_reset_sent",
         )
         return False
@@ -429,14 +497,32 @@ class ProxOpsBT:
         subtree.add_child(action_seq)
         return subtree
 
-    def setup(self) -> bool:
-        self.log("Setting up prox-ops BT actions...")
+    def _build_await_convergence_action(self) -> Behaviour:
+        if self._await_convergence_mode == "wait_for_convergence":
+            return Sequence(
+                "SQ Do wait for convergence",
+                memory=True,
+                children=[
+                    FuncToStatus("Set wait for convergence goal",
+                                 self._set_goal_wait_for_convergence),
+                    self.act_wait_for_convergence,
+                ],
+            )
 
-        for ac in self._action_clients:
-            ac.setup()
-            if ac.state != ActionClientState.READY:
-                self.log(f"{ac.name} failed to setup. State: {str(ac.state)}")
-                return False
+        return Sequence(
+            "SQ Do loiter / patrol",
+            memory=True,
+            children=[
+                FuncToStatus("Set loiter / patrol goal",
+                             self._set_goal_loiter_patrol),
+                self.act_loiter_patrol,
+            ],
+        )
+
+    def _build_tree(self) -> None:
+        self.log(
+            f"Building prox-ops BT with {self._await_convergence_mode} await-convergence action."
+        )
 
         do_inspection = Sequence(
             "SQ Do inspection",
@@ -476,23 +562,13 @@ class ProxOpsBT:
             act=do_intercept,
         )
 
-        do_loiter_patrol = Sequence(
-            "SQ Do loiter / patrol",
-            memory=True,
-            children=[
-                FuncToStatus("Set loiter / patrol goal",
-                             self._set_goal_loiter_patrol),
-                self.act_loiter_patrol,
-            ],
-        )
-
-        loiter_patrol = self._post_pre_act(
-            title="Lost target / patrol",
+        await_convergence = self._post_pre_act(
+            title="Await convergence",
             post_condition=self._backend_converged_target_found_and_has_plan,
             post_title="Backend converged, has found the target, and has plan",
-            pre_condition=self._patrol_timeout_not_exceeded,
-            pre_title="Patrol timeout not exceeded",
-            act=do_loiter_patrol,
+            pre_condition=self._await_convergence_timeout_not_exceeded,
+            pre_title="Await-convergence timeout not exceeded",
+            act=self._build_await_convergence_action(),
         )
 
         # Root of the BT.
@@ -502,11 +578,24 @@ class ProxOpsBT:
             children=[
                 inspect,
                 intercept,
-                loiter_patrol,
+                await_convergence,
             ],
         )
 
         self._bt = BehaviourTree(root)
+        self._prev_tree_str = ""
+
+    def setup(self) -> bool:
+        self.log("Setting up prox-ops BT actions...")
+
+        for ac in self._required_startup_action_clients:
+            ac.setup()
+            if ac.state != ActionClientState.READY:
+                self.log(f"{ac.name} failed to setup. State: {str(ac.state)}")
+                return False
+            self._setup_action_clients.add(ac)
+
+        self._build_tree()
         self.log("prox-ops BT setup complete.")
         return True
 

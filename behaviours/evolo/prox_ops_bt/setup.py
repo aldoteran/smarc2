@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name, [
             'README.md',
             'prox_ops_bt/goal_example.json',
+            'prox_ops_bt/goal_example_wait_for_convergence.json',
             'prox_ops_bt/goal_example.md',
         ]),
     ],

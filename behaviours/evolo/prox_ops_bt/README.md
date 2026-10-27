@@ -32,6 +32,31 @@ For developer tests, the server also accepts the inner mission object directly:
 }
 ```
 
+The final await-convergence behavior is selected by the goal. Include exactly
+one of:
+
+```json
+"loiter_patrol": {
+  "timeout_s": 30.0,
+  "speed": "standard",
+  "waypoints": [
+    {"latitude": 58.822943, "longitude": 17.634076},
+    {"latitude": 58.821758, "longitude": 17.634371}
+  ]
+}
+```
+
+or:
+
+```json
+"wait_for_convergence": {
+  "timeout_s": 30.0
+}
+```
+
+`wait_for_convergence.timeout_s` is sent to the `smarc_wait` action as
+`timeout`.
+
 See `goal_example.json` and `goal_example.md` for a complete example and field
 descriptions.
 
@@ -39,6 +64,14 @@ descriptions.
 
 ```bash
 GOAL_JSON="$(jq -c . install/share/prox_ops_bt/goal_example.json)"
+ros2 action send_goal /evolo/prox_ops_bt smarc_msgs/action/BaseAction \
+"{goal: {data: '${GOAL_JSON}'}}"
+```
+
+For the stationary wait variant:
+
+```bash
+GOAL_JSON="$(jq -c . install/share/prox_ops_bt/goal_example_wait_for_convergence.json)"
 ros2 action send_goal /evolo/prox_ops_bt smarc_msgs/action/BaseAction \
 "{goal: {data: '${GOAL_JSON}'}}"
 ```

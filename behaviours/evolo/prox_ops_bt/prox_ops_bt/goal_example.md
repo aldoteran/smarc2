@@ -44,6 +44,23 @@ Developer-friendly direct payload, also accepted:
 }
 ```
 
+To wait in place instead of running loiter/patrol, replace `loiter_patrol` with
+`wait_for_convergence`:
+
+```json
+{
+  "inspect": {
+    "timeout_s": 5.0
+  },
+  "intercept": {
+    "geofence_check_enabled": false
+  },
+  "wait_for_convergence": {
+    "timeout_s": 30.0
+  }
+}
+```
+
 When `json-params` is present, `prox_ops_bt` parses it first and validates the
 inner object.
 
@@ -58,10 +75,16 @@ prox-ops mission has succeeded.
 : Configuration for the intercept branch. The BT forwards this object to
 `evolo_target_intercept`.
 
+Exactly one of `loiter_patrol` or `wait_for_convergence` must be present.
+
 `loiter_patrol`
-: Configuration for the lost-target/patrol branch. The BT forwards this object
-to `evolo_loiter_patrol` and also uses its timeout to decide when to give up
-the prox-ops mission.
+: Configuration for the moving await-convergence branch. The BT forwards this
+object to `evolo_loiter_patrol` and also uses its timeout to decide when to
+give up the prox-ops mission.
+
+`wait_for_convergence`
+: Configuration for the stationary await-convergence branch. The BT converts
+this object to the `smarc_wait` action goal format.
 
 ## Fields
 
@@ -77,6 +100,11 @@ before `prox_ops_bt` reports overall success. This is owned by the BT.
 `loiter_patrol.timeout_s`
 : Positive number of seconds the BT may spend in loiter/patrol before failing
 the overall prox-ops goal and sending backend `RESET` then `STOP`.
+
+`wait_for_convergence.timeout_s`
+: Positive number of seconds the BT may spend waiting in place for backend
+convergence before failing the overall prox-ops goal and sending backend
+`RESET` then `STOP`. The BT sends this to `smarc_wait` as `timeout`.
 
 `loiter_patrol.speed`
 : Speed passed through to `evolo_loiter_patrol`, then delegated to the existing
