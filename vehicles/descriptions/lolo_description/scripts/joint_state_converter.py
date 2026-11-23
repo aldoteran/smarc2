@@ -1,80 +1,109 @@
 #!/usr/bin/env python3
+"""Publish LoLo actuator feedback as joint states for RViz visualization."""
+
+import math
 
 import rclpy
-import math
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from smarc_msgs.msg import FloatStamped, ThrusterFeedback
+from std_msgs.msg import Float32
+from lolo_msgs.msg import Topics
+
 
 class LoloJointStateConverter(Node):
 
-    def elevon_port_callback(self, msg):
-        state = JointState()
-        state.name = ["lolo/elevon_port_joint"]
-        state.position = [-msg.data]
-        self.joint_state_pub.publish(state)
+    def __init__(self):
+        super().__init__("joint_state_converter")
 
-    def elevon_stbd_callback(self, msg):
-        state = JointState()
-        state.name = ["lolo/elevon_stbd_joint"]
-        state.position = [-msg.data]
-        self.joint_state_pub.publish(state)
+        # Names must match the URDF joint names (no robot namespace prefix).
+        self.positions = {
+            "elevator_joint": 0.0,
+            "rudder_port_joint": 0.0,
+            "rudder_stbd_joint": 0.0,
+            "elevon_port_joint": 0.0,
+            "elevon_stbd_joint": 0.0,
+            "thruster_port_joint": 0.0,
+            "thruster_stbd_joint": 0.0,
+            "vert_thruster_front_port_joint": 0.0,
+            "vert_thruster_front_stbd_joint": 0.0,
+            "vert_thruster_back_port_joint": 0.0,
+            "vert_thruster_back_stbd_joint": 0.0,
+        }
 
-    def rudder_callback(self, msg):
-        state = JointState()
-        state.name = ["lolo/rudder_port_joint", "lolo/rudder_stbd_joint"]
-        state.position = [msg.data, msg.data]
-        self.joint_state_pub.publish(state)
+        self.port_rpm = 0.0
+        self.stbd_rpm = 0.0
+        self.last_time = self.get_clock().now()
+
+        self.publisher = self.create_publisher(JointState, "joint_states", 10)
+
+        # Control-surface feedback (angles in radians).
+        self.create_subscription(
+            Float32, Topics.ELEVATOR_FB, self.elevator_callback, 10)
+        self.create_subscription(
+            Float32, Topics.RUDDER_FB, self.rudder_callback, 10)
+        self.create_subscription(
+            Float32, Topics.ELEVON_PORT_FB, self.elevon_port_callback, 10)
+        self.create_subscription(
+            Float32, Topics.ELEVON_STBD_FB, self.elevon_stbd_callback, 10)
+
+        # Main-thruster feedback (RPM).
+        self.create_subscription(
+            Float32, Topics.THRUSTER_PORT_FB, self.thruster_port_callback, 10)
+        self.create_subscription(
+            Float32, Topics.THRUSTER_STBD_FB, self.thruster_stbd_callback, 10)
+
+        self.create_timer(0.2, self.timer_callback)  # 5 Hz
 
     def elevator_callback(self, msg):
-        state = JointState()
-        state.name = ["lolo/elevator_joint"]
-        state.position = [-msg.data]
-        self.joint_state_pub.publish(state)
+        self.positions["elevator_joint"] = -msg.data
+
+    def rudder_callback(self, msg):
+        self.positions["rudder_port_joint"] = msg.data
+        self.positions["rudder_stbd_joint"] = msg.data
+
+    def elevon_port_callback(self, msg):
+        self.positions["elevon_port_joint"] = -msg.data
+
+    def elevon_stbd_callback(self, msg):
+        self.positions["elevon_stbd_joint"] = -msg.data
 
     def thruster_port_callback(self, msg):
-        state = JointState()
-        state.name = ["lolo/thruster_joint_port"]
-        self.velocities[0] = -0.1 * 2.*math.pi/60.*float(msg.rpm.rpm)
-        state.velocity = [self.velocities[0]]
-        self.joint_state_pub.publish(state)
+        self.port_rpm = msg.data
 
     def thruster_stbd_callback(self, msg):
-        state = JointState()
-        state.name = ["lolo/thruster_joint_stbd"]
-        self.velocities[1] = 0.1 * 2.*math.pi/60.*float(msg.rpm.rpm)
-        state.velocity = [self.velocities[1]]
-        self.joint_state_pub.publish(state)
+        self.stbd_rpm = msg.data
 
     def timer_callback(self):
+        now = self.get_clock().now()
+        dt = (now - self.last_time).nanoseconds / 1e9
+        self.last_time = now
+
+        # Avoid an angle jump when simulated time starts or jumps during replay.
+        if dt < 0 or dt > 1.0:
+            dt = 0.0
+
+        # Rotate main propellers at 10% of their measured RPM for RViz.
+        scale = 0.1 * 2.0 * math.pi / 60.0
+        self.positions["thruster_port_joint"] -= self.port_rpm * scale * dt
+        self.positions["thruster_stbd_joint"] += self.stbd_rpm * scale * dt
+        # Vertical thrusters remain at zero; not super fun to visualize.
+
         state = JointState()
-        state.name = ["lolo/thruster_port_joint", "lolo/thruster_stbd_joint"]
-        duration = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
-        state.position = [duration * vel for vel in self.velocities]
-        self.joint_state_pub.publish(state)
-
-    def __init__(self):
-        super().__init__('joint_state_converter')
-        self.joint_state_pub = self.create_publisher(JointState, "command_states", 10)
-
-        self.create_subscription(FloatStamped, "core/elevon_strb_fb", self.elevon_stbd_callback, 10)
-        self.create_subscription(FloatStamped, "core/elevon_port_fb", self.elevon_port_callback, 10)
-        self.create_subscription(FloatStamped, "core/elevator_fb", self.elevator_callback, 10)
-        self.create_subscription(FloatStamped, "core/rudder_fb", self.rudder_callback, 10)
-        self.create_subscription(ThrusterFeedback, "core/thruster1_fb", self.thruster_port_callback, 10)
-        self.create_subscription(ThrusterFeedback, "core/thruster2_fb", self.thruster_stbd_callback, 10)
-
-        self.start_time = self.get_clock().now()
-        self.velocities = [0., 0.]
-        self.create_timer(0.1, self.timer_callback)
+        state.header.stamp = now.to_msg()
+        state.name = list(self.positions.keys())
+        state.position = list(self.positions.values())
+        self.publisher.publish(state)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    converter = LoloJointStateConverter()
-    rclpy.spin(converter)
-    converter.destroy_node()
-    rclpy.shutdown()
+    node = LoloJointStateConverter()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
